@@ -244,7 +244,8 @@ final class OrchestratorTests: XCTestCase {
     func testConcurrentPublishesMintDistinctIncreasingVersionsAndNeverRegress() async throws {
         let clock = ManualClock(1_000)
         let server = InMemoryGateServer()
-        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: server)
+        let spy = RecordingPropagator(wrapping: server)
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: spy)
         try await device.observe(source: .declaredRange, bracket: .adult)
 
         await withTaskGroup(of: Void.self) { group in
@@ -252,11 +253,49 @@ final class OrchestratorTests: XCTestCase {
                 group.addTask { _ = await device.evaluateAndPublish() }
             }
         }
+        let published = await spy.published
+        XCTAssertEqual(published.count, 16)
+        XCTAssertEqual(Set(published.map(\.version)).count, 16, "every publish carried a distinct version")
+        XCTAssertEqual(Set(published.map(\.producedAt)).count, 16, "every publish carried a distinct HLC stamp")
+        let byVersion = published.sorted { $0.version < $1.version }
+        for pair in zip(byVersion, byVersion.dropFirst()) {
+            XCTAssertLessThan(pair.0.producedAt, pair.1.producedAt, "version order and HLC order agree")
+        }
         let status = await device.status
         XCTAssertEqual(status.snapshot.version, 16)
         let held = await server.snapshot(for: Fixtures.account)
-        XCTAssertEqual(held?.version, 16, "the server holds the newest, whichever order acks landed")
-        let awaited17 = await server.publishCount
-        XCTAssertEqual(awaited17, 16)
+        XCTAssertEqual(held?.producedAt, byVersion.last?.producedAt, "the server holds the newest, whichever order acks landed")
+    }
+
+    /// The reentrancy contract, tested with a real suspension: publish #1 is
+    /// held open by the propagator while the state changes and publish #2
+    /// completes. Because #1's snapshot was minted *before* its await, it is
+    /// the stale one — the server must reject it, and the local decision must
+    /// be #2's. An implementation that evaluated after the await would have
+    /// #1 publish the newer state successfully instead.
+    func testSnapshotMintedBeforeFirstAwaitSoLaterStateCannotBeOvertakenByEarlierCall() async throws {
+        let clock = ManualClock(1_000)
+        let server = InMemoryGateServer()
+        let gate = HoldingPropagator(wrapping: server)
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: gate, region: Fixtures.us)
+
+        let first = Task { await device.evaluateAndPublish() } // ageUnknown snapshot, held at the propagator
+        await gate.waitUntilHeld()
+
+        try await device.observe(source: .declaredRange, bracket: .adult)
+        clock.advance(1)
+        let second = await device.evaluateAndPublish()
+        guard case .success = second else { return XCTFail("\(second)") }
+
+        await gate.release()
+        let firstResult = await first.value
+        guard case .failure(.staleVersion) = firstResult else { return XCTFail("stale snapshot must be rejected, got \(firstResult)") }
+
+        let decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .allowed(consentBy: nil))
+        let held = await server.snapshot(for: Fixtures.account)
+        XCTAssertEqual(held?.decision(for: Capability.chat.id), .allowed(consentBy: nil))
+        let status = await device.status
+        XCTAssertNil(status.lastPropagationError, "a stale rejection is not an error")
     }
 }

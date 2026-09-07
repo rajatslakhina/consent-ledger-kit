@@ -246,8 +246,11 @@ public actor ConsentOrchestrator {
         return ledger.tailCount < before
     }
 
-    /// Absorbs another account's ledger into this one (account merge).
-    public func absorb(_ other: Ledger) throws {
+    /// Absorbs another account's ledger into this one (account merge). See
+    /// `AbsorbReport` for what happens to facts older than this ledger's
+    /// compaction horizon.
+    @discardableResult
+    public func absorb(_ other: Ledger) throws -> AbsorbReport {
         let stamp = clock.tick(nowMilliseconds: now())
         sequence = sequence.addingSaturating(1)
         let marker = LedgerEntry(
@@ -256,7 +259,7 @@ public actor ConsentOrchestrator {
             timestamp: stamp,
             kind: .accountMerged(from: other.account)
         )
-        try ledger.absorb(other, mergedAt: marker)
+        return try ledger.absorb(other, mergedAt: marker)
     }
 
     // MARK: Policy / region

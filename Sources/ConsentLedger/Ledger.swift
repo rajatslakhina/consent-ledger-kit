@@ -22,21 +22,37 @@ public struct EntryID: Hashable, Sendable, Codable, Comparable {
     }
 
     /// Sequence numbers at or above this are *synthetic*: minted by
-    /// `Ledger.absorb` to replay decisions out of another account's compacted
-    /// snapshot. They are derived from the decision's timestamp, so two
-    /// replicas absorbing the same account mint the same IDs (idempotent
-    /// merge), and they never collide with a real node's counter, which
-    /// starts at 1 and would need 2⁶³ writes to get here.
+    /// `Ledger.absorb` for entries re-homed from another account. They are
+    /// derived from the entry's original timestamp, so two replicas absorbing
+    /// the same account mint the same IDs (idempotent merge), and they never
+    /// collide with a real node's counter, which starts at 1 and would need
+    /// 2⁶³ writes to get here. Re-homing under the *original* `(node,
+    /// sequence)` would collide whenever both accounts were written on the
+    /// same device — the guest-then-sign-in case this exists for.
     public static let syntheticFloor: UInt64 = 1 << 63
 
+    /// Wall milliseconds are packed above 20 bits of logical counter; 42 bits
+    /// of wall time reach the year 2109. Beyond either limit the packing
+    /// saturates rather than traps — and `synthetic(for:)` is then no longer
+    /// injective, which `Ledger.absorb` detects and reports as
+    /// `LedgerError.syntheticIdentityExhausted` instead of silently dropping
+    /// a decision.
+    static let syntheticWallLimit: Int64 = (1 << 42) - 1
+    static let syntheticLogicalMask: UInt32 = 0xF_FFFF
+
     static func synthetic(for timestamp: HybridTimestamp) -> EntryID {
-        // wall (≤ 2⁴¹ ms until the year 2039, saturating after) packed above
-        // 22 bits of the logical counter. Saturating, never trapping.
-        let wall = UInt64(clamping: timestamp.wallMilliseconds)
+        let wall = UInt64(clamping: min(max(timestamp.wallMilliseconds, 0), syntheticWallLimit))
         let packed = wall
-            .multipliedSaturating(by: 1 << 22)
-            .addingSaturating(UInt64(timestamp.logical & 0x3F_FFFF))
+            .multipliedSaturating(by: 1 << 20)
+            .addingSaturating(UInt64(timestamp.logical & syntheticLogicalMask))
         return EntryID(node: timestamp.node, sequence: syntheticFloor.addingSaturating(packed))
+    }
+
+    /// Whether `synthetic(for:)` is injective for this timestamp.
+    static func canSynthesise(_ timestamp: HybridTimestamp) -> Bool {
+        timestamp.wallMilliseconds >= 0
+            && timestamp.wallMilliseconds <= syntheticWallLimit
+            && timestamp.logical <= syntheticLogicalMask
     }
 
     public var isSynthetic: Bool { sequence >= EntryID.syntheticFloor }
@@ -118,6 +134,24 @@ public enum LedgerError: Error, Hashable, Sendable {
     case entryPredatesSnapshot(EntryID)
     /// The entry belongs to a different account and no merge was declared.
     case foreignAccount(expected: Identifier, actual: Identifier)
+    /// An absorbed entry's timestamp is outside the range for which synthetic
+    /// IDs are unique (see `EntryID.synthetic(for:)`); absorbing it could
+    /// silently discard another decision, so the whole absorb is refused.
+    case syntheticIdentityExhausted(HybridTimestamp)
+}
+
+/// What `Ledger.absorb` did. Grants that predate this ledger's compaction
+/// horizon cannot be folded in order any more and are *dropped*, never
+/// re-timestamped: a grant moved later in history could re-open a gate that
+/// a folded revocation had closed. Revocations that predate the horizon are
+/// re-timestamped to the merge instant instead — moving a "no" later only
+/// ever closes gates. The counts are returned so the caller can surface
+/// them; a dropped grant is a consent the guardian has to give again.
+public struct AbsorbReport: Hashable, Sendable {
+    public let imported: Int
+    public let revocationsRetimestamped: Int
+    public let grantsDropped: Int
+    public let otherDropped: Int
 }
 
 /// The append-only, mergeable consent log for one account.
@@ -189,42 +223,71 @@ public struct Ledger: Hashable, Sendable, Codable {
         try merge(entries: Array(other.tail.values))
     }
 
-    /// Absorbs another *account's* ledger — the account-merge case. The
-    /// other ledger's entries are re-homed under this account, an
+    /// Absorbs another *account's* ledger — the account-merge case. Every
+    /// fact from the other ledger (its compacted snapshot's age facts and
+    /// guardian decisions, plus its uncompacted tail) is re-homed under this
+    /// account with a synthetic, timestamp-derived identity, an
     /// `accountMerged` marker is appended, and the fold takes the union.
     /// Revocations in either ledger survive by construction.
-    public mutating func absorb(_ other: Ledger, mergedAt marker: LedgerEntry) throws {
+    ///
+    /// If this ledger has already compacted past some of the other's
+    /// history, see `AbsorbReport` for the fail-closed rule applied.
+    @discardableResult
+    public mutating func absorb(_ other: Ledger, mergedAt marker: LedgerEntry) throws -> AbsorbReport {
         guard marker.account == account, case .accountMerged(let from) = marker.kind, from == other.account else {
             throw LedgerError.foreignAccount(expected: account, actual: marker.account)
         }
-        // The other ledger may itself have been compacted. Its snapshot's
-        // age facts and decisions are replayed as explicit, synthetic entries
-        // (timestamped as they originally were) so nothing is lost and the
-        // fold sees the guest's age *before* the guest's consent decisions.
-        var imported: [LedgerEntry] = []
+        var facts: [(timestamp: HybridTimestamp, kind: ConsentEventKind)] = []
         let otherState = other.snapshot.state
         if let bracket = otherState.declaredBracket, let at = otherState.declaredAt {
-            imported.append(LedgerEntry(id: EntryID.synthetic(for: at), account: account, timestamp: at, kind: .ageDeclared(bracket)))
+            facts.append((at, .ageDeclared(bracket)))
         }
         if let bracket = otherState.verifiedBracket, let source = otherState.verifiedBy, let at = otherState.verifiedAt {
-            imported.append(LedgerEntry(id: EntryID.synthetic(for: at), account: account, timestamp: at, kind: .ageVerified(bracket, source: source)))
+            facts.append((at, .ageVerified(bracket, source: source)))
         }
         for decision in otherState.decisions.values.flatMap(\.allDecisions) {
             let kind: ConsentEventKind = decision.isGranted
                 ? .consentGranted(guardian: decision.guardian, scope: decision.scope)
                 : .consentRevoked(guardian: decision.guardian, scope: decision.scope)
-            imported.append(LedgerEntry(
-                id: EntryID.synthetic(for: decision.decidedAt),
-                account: account,
-                timestamp: decision.decidedAt,
-                kind: kind
-            ))
+            facts.append((decision.decidedAt, kind))
         }
         for entry in other.tail.values {
-            imported.append(LedgerEntry(id: entry.id, account: account, timestamp: entry.timestamp, kind: entry.kind))
+            facts.append((entry.timestamp, entry.kind))
+        }
+
+        var imported: [LedgerEntry] = []
+        var retimestamped = 0
+        var grantsDropped = 0
+        var otherDropped = 0
+        for fact in facts {
+            guard EntryID.canSynthesise(fact.timestamp) else {
+                throw LedgerError.syntheticIdentityExhausted(fact.timestamp)
+            }
+            let id = EntryID.synthetic(for: fact.timestamp)
+            var timestamp = fact.timestamp
+            if let horizon = snapshot.horizon, timestamp < horizon {
+                switch fact.kind {
+                case .consentRevoked:
+                    timestamp = marker.timestamp
+                    retimestamped = retimestamped.addingSaturating(1)
+                case .consentGranted:
+                    grantsDropped = grantsDropped.addingSaturating(1)
+                    continue
+                default:
+                    otherDropped = otherDropped.addingSaturating(1)
+                    continue
+                }
+            }
+            imported.append(LedgerEntry(id: id, account: account, timestamp: timestamp, kind: fact.kind))
         }
         imported.append(marker)
         try merge(entries: imported)
+        return AbsorbReport(
+            imported: imported.count,
+            revocationsRetimestamped: retimestamped,
+            grantsDropped: grantsDropped,
+            otherDropped: otherDropped
+        )
     }
 
     // MARK: Fold

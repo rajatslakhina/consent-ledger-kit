@@ -163,9 +163,21 @@ final class PrimitiveTests: XCTestCase {
         XCTAssertEqual(a, b)
         XCTAssertTrue(a.isSynthetic)
         XCTAssertFalse(EntryID(node: "g", sequence: 1).isSynthetic)
-        let far = EntryID.synthetic(for: HybridTimestamp(wallMilliseconds: Int64.max, logical: UInt32.max, node: "g"))
-        XCTAssertEqual(far.sequence, UInt64.max) // saturated, no trap
         let other = EntryID.synthetic(for: HybridTimestamp(wallMilliseconds: 1_700_000_000_000, logical: 4, node: "g"))
         XCTAssertNotEqual(a, other)
+
+        // Beyond the packing range the ID is not unique any more; the packing
+        // must not trap, and `canSynthesise` must say so, so `absorb` refuses.
+        let far = HybridTimestamp(wallMilliseconds: Int64.max, logical: UInt32.max, node: "g")
+        XCTAssertLessThanOrEqual(EntryID.synthetic(for: far).sequence, UInt64.max)
+        XCTAssertFalse(EntryID.canSynthesise(far))
+        XCTAssertFalse(EntryID.canSynthesise(HybridTimestamp(wallMilliseconds: -1, logical: 0, node: "g")))
+        XCTAssertFalse(EntryID.canSynthesise(HybridTimestamp(wallMilliseconds: 1, logical: 1 << 20, node: "g")))
+        XCTAssertTrue(EntryID.canSynthesise(HybridTimestamp(wallMilliseconds: EntryID.syntheticWallLimit, logical: EntryID.syntheticLogicalMask, node: "g")))
+        // Year-2109 ceiling: two distinct in-range stamps never collide.
+        let edgeA = EntryID.synthetic(for: HybridTimestamp(wallMilliseconds: EntryID.syntheticWallLimit, logical: 0, node: "g"))
+        let edgeB = EntryID.synthetic(for: HybridTimestamp(wallMilliseconds: EntryID.syntheticWallLimit - 1, logical: EntryID.syntheticLogicalMask, node: "g"))
+        XCTAssertNotEqual(edgeA, edgeB)
+        XCTAssertLessThan(edgeA.sequence, UInt64.max)
     }
 }

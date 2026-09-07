@@ -129,15 +129,18 @@ public final class ConsentSimulation: ObservableObject {
         }
     }
 
-    /// Simulates a guest account (used before sign-in) whose guardian had
-    /// revoked chat, being merged into the signed-in account.
+    /// Simulates a guest account (used before sign-in) in which a *different*
+    /// guardian had revoked chat, being merged into the signed-in account.
+    /// Because any guardian's revocation beats any other guardian's grant,
+    /// chat stays closed on the merged account even if Maya later grants all.
     public func mergeGuestAccount() {
         guard !mergedGuest else { return }
         mergedGuest = true
         Task {
-            await run("Merge guest account (had chat revoked)") {
+            await run("Merge guest account (guardian-omar had revoked chat)") {
                 let guestAccount: Identifier = "acct-guest-777"
                 let guestNode: Identifier = "guest-device"
+                let otherGuardian: Identifier = "guardian-omar"
                 let chat = Capability.chat.id
                 var guest = Ledger(account: guestAccount)
                 var clock = HybridClock(node: guestNode)
@@ -148,9 +151,12 @@ public final class ConsentSimulation: ObservableObject {
                 ))
                 try guest.append(LedgerEntry(
                     id: EntryID(node: guestNode, sequence: 2), account: guestAccount,
-                    timestamp: clock.tick(nowMilliseconds: base.addingSaturating(1)), kind: .consentRevoked(guardian: self.guardianID, scope: .capabilities([chat]))
+                    timestamp: clock.tick(nowMilliseconds: base.addingSaturating(1)), kind: .consentRevoked(guardian: otherGuardian, scope: .capabilities([chat]))
                 ))
-                try await self.childDevice.absorb(guest)
+                let report = try await self.childDevice.absorb(guest)
+                if report.grantsDropped > 0 || report.revocationsRetimestamped > 0 {
+                    self.append("  ↳ merged past compaction horizon: \(report.revocationsRetimestamped) revocation(s) re-timestamped, \(report.grantsDropped) grant(s) dropped")
+                }
             }
         }
     }

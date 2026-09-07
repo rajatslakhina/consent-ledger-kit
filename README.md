@@ -17,7 +17,7 @@
 
 The demo app runs two of these side by side (a child's iPad and a guardian's iPhone, clocks 90 s apart) against one in-memory backend, so you can watch a revocation on one device close a gate on the other after a sync.
 
-- **Demo app:** (added after the companion repo is pushed — see below)
+- **Demo app:** [`consent-ledger-kit-demo-app`](https://github.com/rajatslakhina/consent-ledger-kit-demo-app) — a separate `Demo.xcodeproj` that consumes this package as a remote, version-pinned dependency.
 
 ## Why this matters
 
@@ -43,8 +43,8 @@ Two devices act in the same HLC millisecond: the guardian grants on the iPhone, 
 A compacted entry is no longer shipped by `merge`, so folding it into the snapshot before a peer has it breaks convergence. `Ledger` therefore only *reports* `needsCompaction`; `ConsentOrchestrator.compactIfSafe()` compacts only entries a peer has acknowledged, and only the contiguous-per-node prefix that cannot be re-ordered by a late arrival. Growth is bounded by `Limits.hardCapacity`; a merge that would exceed it is refused whole (`LedgerError.capacityExceeded`), leaving the ledger intact.
 *Cost:* a device that never syncs never compacts. It also never loses a fact, which is the right trade for a consent log.
 
-**5. Account merge replays facts, not state.**
-`Ledger.absorb` re-homes the other account's tail under this account and replays its compacted snapshot (age facts and every guardian decision) as *synthetic* entries with their original timestamps and deterministic IDs (`EntryID.synthetic(for:)`), so absorbing twice is a no-op and the guest account's chat revocation survives the merge.
+**5. Account merge replays facts, not state — and is fail-closed past the horizon.**
+`Ledger.absorb` re-homes every fact from the other account (its compacted snapshot's age facts and guardian decisions, plus its tail) as *synthetic* entries with their original timestamps and deterministic, timestamp-derived IDs (`EntryID.synthetic(for:)`), so absorbing twice is a no-op, the guest account's chat revocation survives the merge, and a guest written on the *same device* (same node, sequences restarting at 1) cannot overwrite the signed-in account's own entries. If this ledger has already compacted past the guest's history, older facts cannot be folded in order any more: grants are **dropped** (a grant moved later in history could re-open a gate a folded revocation closed), revocations are re-timestamped to the merge instant (moving a "no" later only closes gates), and the caller gets an `AbsorbReport` saying so. Synthetic IDs are unique through the year 2109; beyond that `absorb` refuses rather than silently discarding a decision.
 *Rejected alternative:* merging folded `ConsentState` values. There is no correct merge of two states without their history.
 
 **6. Unknown region = the meet of every known rule. Remote updates can only tighten.**
@@ -96,8 +96,8 @@ Features import `CapabilityGate`'s decision. They never import an age.
 
 This section is written against what actually ran, not what should have.
 
-- **Linux, Swift 6.0.3:** `rm -rf .build && swift build -Xswiftc -warnings-as-errors` → `Build complete!` with zero warnings; `swift build --build-tests -Xswiftc -warnings-as-errors && swift test` → **65 tests, 0 failures** across `PrimitiveTests` (15), `ReconciliationTests` (10), `LedgerTests` (17), `GateTests` (8), `OrchestratorTests` (9), `AuditTests` (6).
-- **Negative controls in the suite:** `ConvergenceAudit` must *fail* on `arrivalOrderFold`; `FailClosedAudit` must *fail* on the optimistic evaluator and on a "we'll ask later" consent bypass; a same-instant grant/revoke must fold to revoked with the node names in either order; a merge past `hardCapacity` must throw and leave the ledger untouched.
+- **Linux, Swift 6.0.3:** `rm -rf .build && swift build -Xswiftc -warnings-as-errors` → `Build complete!` with zero warnings; `swift build --build-tests -Xswiftc -warnings-as-errors && swift test` → **69 tests, 0 failures** across `PrimitiveTests` (15), `ReconciliationTests` (10), `LedgerTests` (20), `GateTests` (8), `OrchestratorTests` (10), `AuditTests` (6).
+- **Negative controls in the suite:** `ConvergenceAudit` must *fail* on `arrivalOrderFold`; `FailClosedAudit` must *fail* on the optimistic evaluator and on a "we'll ask later" consent bypass; a same-instant grant/revoke must fold to revoked with the node names in either order; a merge past `hardCapacity` must throw and leave the ledger untouched; a publish held open across a real suspension while the state changes must come back `staleVersion`, never overtake the newer snapshot.
 - **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the Linux job above on every push (warnings-as-errors is enforced there, not asserted in prose) and a macOS job that compiles `ConsentLedgerUI` for `generic/platform=iOS Simulator`. The Actions tab is the source of truth for the current status.
 - **Simulator:** this package contains no app. The companion demo repo states, separately, whether its app was *built* for a Simulator and whether it was *run* on one.
 
@@ -106,7 +106,7 @@ This section is written against what actually ran, not what should have.
 ```
 Sources/ConsentLedger/       Primitives · AgeSignal · ConsentStateMachine · Ledger · CapabilityGate · Propagation · ConsentOrchestrator · Audit
 Sources/ConsentLedgerUI/     ConsentOrchestrationDemoView (SwiftUI; empty target on Linux)
-Tests/ConsentLedgerTests/    65 XCTest cases, including the negative controls above
+Tests/ConsentLedgerTests/    69 XCTest cases, including the negative controls above
 ```
 
 No executable target. The runnable app lives in the companion repo and consumes this package as a version-pinned remote dependency.

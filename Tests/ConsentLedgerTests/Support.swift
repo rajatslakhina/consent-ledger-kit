@@ -102,3 +102,48 @@ final class ManualClock: @unchecked Sendable {
         { [self] in self.now }
     }
 }
+
+/// Records every snapshot it forwards.
+actor RecordingPropagator: GatePropagator {
+    private let inner: GatePropagator
+    private(set) var published: [GateSnapshot] = []
+
+    init(wrapping inner: GatePropagator) { self.inner = inner }
+
+    func publish(_ snapshot: GateSnapshot, account: Identifier) async throws -> PropagationAck {
+        published.append(snapshot)
+        return try await inner.publish(snapshot, account: account)
+    }
+}
+
+/// Holds the *first* publish open until released; later publishes pass straight through.
+actor HoldingPropagator: GatePropagator {
+    private let inner: GatePropagator
+    private var held: CheckedContinuation<Void, Never>?
+    private var heldWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hasHeld = false
+
+    init(wrapping inner: GatePropagator) { self.inner = inner }
+
+    func publish(_ snapshot: GateSnapshot, account: Identifier) async throws -> PropagationAck {
+        if !hasHeld {
+            hasHeld = true
+            await withCheckedContinuation { continuation in
+                held = continuation
+                for waiter in heldWaiters { waiter.resume() }
+                heldWaiters = []
+            }
+        }
+        return try await inner.publish(snapshot, account: account)
+    }
+
+    func waitUntilHeld() async {
+        if held != nil { return }
+        await withCheckedContinuation { continuation in heldWaiters.append(continuation) }
+    }
+
+    func release() {
+        held?.resume()
+        held = nil
+    }
+}

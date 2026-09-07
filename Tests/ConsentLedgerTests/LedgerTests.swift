@@ -279,6 +279,81 @@ final class LedgerTests: XCTestCase {
         XCTAssertEqual(main.tailCount, 0)
     }
 
+    /// The guest-then-sign-in case: both accounts were written by the *same*
+    /// device, so both ledgers' real entries start at `(node, 1)`. Re-homing
+    /// under the original ID would overwrite the signed-in account's entries.
+    func testAbsorbFromSameNodeDoesNotCollideWithOwnEntries() throws {
+        var main = Ledger(account: Fixtures.account)
+        try main.merge(entries: [
+            Fixtures.entry(1, at: 1_000, .ageDeclared(.thirteenToFifteen)),
+            Fixtures.entry(2, at: 2_000, .consentGranted(guardian: g, scope: .all))
+        ])
+        var guest = Ledger(account: "guest")
+        try guest.merge(entries: [
+            LedgerEntry(id: EntryID(node: Fixtures.childNode, sequence: 1), account: "guest",
+                        timestamp: Fixtures.stamp(500), kind: .ageDeclared(.under13)),
+            LedgerEntry(id: EntryID(node: Fixtures.childNode, sequence: 2), account: "guest",
+                        timestamp: Fixtures.stamp(600), kind: .consentRevoked(guardian: Fixtures.otherGuardian, scope: .capabilities([chat])))
+        ])
+        let report = try main.absorb(guest, mergedAt: Fixtures.entry(3, at: 3_000, .accountMerged(from: "guest")))
+        XCTAssertEqual(report.imported, 3)
+        XCTAssertEqual(report.grantsDropped, 0)
+        XCTAssertEqual(main.tailCount, 5, "two own entries + two re-homed + marker; nothing overwritten")
+        XCTAssertNotNil(main.tail[EntryID(node: Fixtures.childNode, sequence: 1)])
+        XCTAssertNotNil(main.tail[EntryID(node: Fixtures.childNode, sequence: 2)])
+        let state = main.fold()
+        XCTAssertEqual(state.consentStatus(for: chat), .revoked(by: Fixtures.otherGuardian))
+        XCTAssertEqual(state.consentStatus(for: Capability.purchases.id), .granted(by: g))
+        XCTAssertEqual(state.declaredBracket, .thirteenToFifteen, "main's later declaration wins on timestamp")
+    }
+
+    /// Once this ledger has compacted past the guest's history, grants that
+    /// predate the horizon are dropped and revocations move to the merge
+    /// instant. The gate can only get more closed.
+    func testAbsorbPastCompactionHorizonIsFailClosedNotAnError() throws {
+        var main = Ledger(account: Fixtures.account, limits: .init(compactionThreshold: 1, hardCapacity: 100))
+        try main.merge(entries: [
+            Fixtures.entry(1, at: 5_000, .ageDeclared(.thirteenToFifteen)),
+            Fixtures.entry(2, at: 6_000, .consentRevoked(guardian: g, scope: .capabilities([Capability.purchases.id])))
+        ])
+        main.compact()
+        XCTAssertEqual(main.snapshot.horizon, Fixtures.stamp(6_000))
+
+        var guest = Ledger(account: "guest")
+        try guest.merge(entries: [
+            LedgerEntry(id: EntryID(node: "gd", sequence: 1), account: "guest", timestamp: Fixtures.stamp(1_000, node: "gd"), kind: .ageDeclared(.under13)),
+            // A guest grant of *everything* by the same guardian, older than the horizon.
+            LedgerEntry(id: EntryID(node: "gd", sequence: 2), account: "guest", timestamp: Fixtures.stamp(2_000, node: "gd"), kind: .consentGranted(guardian: g, scope: .all)),
+            LedgerEntry(id: EntryID(node: "gd", sequence: 3), account: "guest", timestamp: Fixtures.stamp(3_000, node: "gd"), kind: .consentRevoked(guardian: Fixtures.otherGuardian, scope: .capabilities([chat])))
+        ])
+        let report = try main.absorb(guest, mergedAt: Fixtures.entry(3, at: 7_000, .accountMerged(from: "guest")))
+        XCTAssertEqual(report.grantsDropped, 1, "a grant cannot be moved later in history")
+        XCTAssertEqual(report.revocationsRetimestamped, 1)
+        XCTAssertEqual(report.otherDropped, 1, "the guest's age declaration predates the horizon")
+        let state = main.fold()
+        XCTAssertEqual(state.consentStatus(for: Capability.purchases.id), .revoked(by: g), "the folded revocation is not re-opened by the older guest grant")
+        XCTAssertEqual(state.consentStatus(for: chat), .revoked(by: Fixtures.otherGuardian), "the guest's revocation still lands")
+        XCTAssertEqual(state.mergedAccounts, ["guest"])
+
+        // Idempotent even after re-timestamping: IDs derive from the original stamps.
+        let tail = main.tailCount
+        try main.absorb(guest, mergedAt: Fixtures.entry(3, at: 7_000, .accountMerged(from: "guest")))
+        XCTAssertEqual(main.tailCount, tail)
+    }
+
+    func testAbsorbRefusesTimestampsOutsideSyntheticRange() throws {
+        var main = Ledger(account: Fixtures.account)
+        var guest = Ledger(account: "guest")
+        try guest.merge(entries: [
+            LedgerEntry(id: EntryID(node: "gd", sequence: 1), account: "guest",
+                        timestamp: HybridTimestamp(wallMilliseconds: Int64.max, logical: 0, node: "gd"), kind: .ageDeclared(.under13))
+        ])
+        XCTAssertThrowsError(try main.absorb(guest, mergedAt: Fixtures.entry(1, at: 1, .accountMerged(from: "guest")))) { error in
+            guard case .syntheticIdentityExhausted? = error as? LedgerError else { return XCTFail("\(error)") }
+        }
+        XCTAssertEqual(main.tailCount, 0)
+    }
+
     // MARK: Codable round trip
 
     func testLedgerRoundTripsThroughJSON() throws {
