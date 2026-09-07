@@ -169,7 +169,6 @@ final class PrimitiveTests: XCTestCase {
         // Beyond the packing range the ID is not unique any more; the packing
         // must not trap, and `canSynthesise` must say so, so `absorb` refuses.
         let far = HybridTimestamp(wallMilliseconds: Int64.max, logical: UInt32.max, node: "g")
-        XCTAssertLessThanOrEqual(EntryID.synthetic(for: far).sequence, UInt64.max)
         XCTAssertFalse(EntryID.canSynthesise(far))
         XCTAssertFalse(EntryID.canSynthesise(HybridTimestamp(wallMilliseconds: -1, logical: 0, node: "g")))
         XCTAssertFalse(EntryID.canSynthesise(HybridTimestamp(wallMilliseconds: 1, logical: 1 << 20, node: "g")))

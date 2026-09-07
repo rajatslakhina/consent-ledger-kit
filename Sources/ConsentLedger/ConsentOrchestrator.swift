@@ -50,12 +50,22 @@ public struct OrchestratorStatus: Sendable, Hashable {
 /// signal cache and the publish pipeline, and is the only place a
 /// `GateSnapshot` version is minted.
 ///
-/// Reentrancy contract: every method that changes state does so *before*
-/// its first `await`. `evaluateAndPublish` mints the version and stores the
-/// snapshot synchronously, then awaits the propagator. Two overlapping calls
-/// therefore mint distinct, increasing versions; whichever ack arrives last
-/// cannot regress `lastAcknowledged` because acks are folded with `max`,
-/// and the server's monotone contract rejects the older one.
+/// Reentrancy contract: `evaluateAndPublish` mints the version and stores
+/// the snapshot synchronously *before* its first `await`, then awaits the
+/// propagator. Two overlapping calls therefore mint distinct, increasing
+/// versions; whichever ack arrives last cannot regress `lastAcknowledged`
+/// because acks are folded with `max`, and the server's monotone contract
+/// rejects the older one. The two places state *is* touched after an
+/// `await` are monotone by construction: `refreshSignals` ingests each
+/// provider's answer after awaiting it, and `ingest` only ever replaces a
+/// signal with a strictly newer one; the ack bookkeeping after a publish
+/// folds with `max` and only clears the error for the newest snapshot.
+///
+/// Freshness contract: every mutation (`observe`, consent changes,
+/// `importEntries`, `absorb`, `setRegion`, `applyPolicyUpdate`, ingested
+/// signals) invalidates the cached snapshot, so `decision(for:)` never
+/// answers from a snapshot older than the last mutation — a locally recorded
+/// revocation closes the gate on the very next call, publish or no publish.
 public actor ConsentOrchestrator {
     public let configuration: OrchestratorConfiguration
 
@@ -66,6 +76,9 @@ public actor ConsentOrchestrator {
     private var policy: JurisdictionPolicy
     private var region: Identifier?
     private var gateVersion: UInt64 = 0
+    /// The last minted snapshot, or `nil` when a mutation has happened since
+    /// it was minted. `decision(for:)` re-mints on `nil`, so a stale snapshot
+    /// can never be served after a gate-closing change.
     private var currentSnapshot: GateSnapshot?
     private var lastAcknowledged: HybridTimestamp?
     private var lastPropagationError: String?
@@ -169,6 +182,7 @@ public actor ConsentOrchestrator {
         clock.receive(signal.observedAt, nowMilliseconds: now())
         if let existing = signals[signal.source], existing.observedAt >= signal.observedAt { return }
         signals[signal.source] = signal
+        currentSnapshot = nil
         guard appending else { return }
         let kind: ConsentEventKind = signal.source == .declaredRange
             ? .ageDeclared(signal.bracket)
@@ -200,6 +214,7 @@ public actor ConsentOrchestrator {
             kind: kind
         )
         try ledger.append(entry)
+        currentSnapshot = nil
     }
 
     // MARK: Sync
@@ -218,6 +233,7 @@ public actor ConsentOrchestrator {
     public func importEntries(_ entries: [LedgerEntry]) throws {
         for entry in entries { clock.receive(entry.timestamp, nowMilliseconds: now()) }
         try ledger.merge(entries: entries)
+        currentSnapshot = nil
         for entry in entries {
             switch entry.kind {
             case .ageDeclared(let bracket):
@@ -259,14 +275,22 @@ public actor ConsentOrchestrator {
             timestamp: stamp,
             kind: .accountMerged(from: other.account)
         )
-        return try ledger.absorb(other, mergedAt: marker)
+        let report = try ledger.absorb(other, mergedAt: marker)
+        currentSnapshot = nil
+        return report
     }
 
     // MARK: Policy / region
 
-    public func setRegion(_ region: Identifier?) { self.region = region }
+    public func setRegion(_ region: Identifier?) {
+        self.region = region
+        currentSnapshot = nil
+    }
 
-    public func applyPolicyUpdate(_ update: JurisdictionPolicy) { policy = policy.applying(update: update) }
+    public func applyPolicyUpdate(_ update: JurisdictionPolicy) {
+        policy = policy.applying(update: update)
+        currentSnapshot = nil
+    }
 
     public var activePolicy: JurisdictionPolicy { policy }
 

@@ -255,7 +255,10 @@ final class LedgerTests: XCTestCase {
         var main = Ledger(account: Fixtures.account)
         let guest = Ledger(account: "guest")
         let wrong = Fixtures.entry(1, at: 1, .accountMerged(from: "not-guest"))
-        XCTAssertThrowsError(try main.absorb(guest, mergedAt: wrong))
+        XCTAssertThrowsError(try main.absorb(guest, mergedAt: wrong)) { error in
+            XCTAssertEqual(error as? LedgerError, .foreignAccount(expected: Fixtures.account, actual: Fixtures.account))
+        }
+        XCTAssertEqual(main.tailCount, 0)
     }
 
     func testSyntheticEntriesCompactWithoutBlockingRealOnes() throws {

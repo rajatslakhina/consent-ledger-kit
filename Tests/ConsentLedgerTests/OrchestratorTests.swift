@@ -32,6 +32,49 @@ final class OrchestratorTests: XCTestCase {
         }
     }
 
+    /// The gate must never answer from a snapshot older than the last
+    /// mutation. No `evaluateAndPublish` between the change and the read.
+    func testDecisionReflectsEveryMutationWithoutAPublish() async throws {
+        let clock = ManualClock(10_000)
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: InMemoryGateServer(), region: Fixtures.uk)
+        _ = await device.evaluateAndPublish() // caches an ageUnknown snapshot
+        var decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .denied(.ageUnknown))
+
+        try await device.observe(source: .declaredRange, bracket: .thirteenToFifteen)
+        decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .denied(.consentRequired), "observe invalidates")
+
+        try await device.grantConsent(guardian: g, scope: .all)
+        decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .allowed(consentBy: g), "grant invalidates")
+
+        try await device.revokeConsent(guardian: g, scope: .all)
+        decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .denied(.consentRevoked), "revoke closes the gate on the very next read")
+
+        try await device.grantConsent(guardian: g, scope: .all)
+        await device.setRegion(Fixtures.us)
+        decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .allowed(consentBy: nil), "region change invalidates (US chat needs no consent)")
+
+        await device.applyPolicyUpdate(JurisdictionPolicy(
+            version: 2, rules: [Fixtures.us: [Capability.chat.id: CapabilityRule(minimumAge: 16, guardianConsentBelow: nil)]],
+            baseline: Fixtures.policy.baseline
+        ))
+        decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .denied(.belowMinimumAge), "policy update invalidates")
+
+        // A peer's revocation merged via importEntries closes immediately too.
+        await device.setRegion(Fixtures.uk)
+        let peerRevoke = LedgerEntry(id: EntryID(node: Fixtures.guardianNode, sequence: 1), account: Fixtures.account,
+                                     timestamp: Fixtures.stamp(20_000, node: Fixtures.guardianNode),
+                                     kind: .consentRevoked(guardian: Fixtures.otherGuardian, scope: .capabilities([Capability.chat.id])))
+        try await device.importEntries([peerRevoke])
+        decision = await device.decision(for: .chat)
+        XCTAssertEqual(decision, .denied(.consentRevoked), "importEntries invalidates")
+    }
+
     // MARK: Two devices converge
 
     func testChildAndGuardianConvergeAfterSyncAndServerHoldsNewest() async throws {

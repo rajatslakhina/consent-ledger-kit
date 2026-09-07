@@ -50,7 +50,8 @@ A compacted entry is no longer shipped by `merge`, so folding it into the snapsh
 **6. Unknown region = the meet of every known rule. Remote updates can only tighten.**
 `JurisdictionPolicy.rule(for:in:)` returns the most-restrictive combination (`CapabilityRule.meet`, a semilattice, so order cannot matter) when the region is `nil` or unlisted. `applying(update:)` meets each remote rule with the compiled-in one and ignores regions the binary does not know: an unknown region is already at the strictest rule, so "recognising" it remotely could only loosen it — that change ships through App Review, not a config push.
 
-**7. Propagation is monotone on an HLC, not on a version counter.**
+**7. The gate is never stale, and propagation is monotone on an HLC, not on a version counter.**
+Every mutation on `ConsentOrchestrator` — an observed signal, a consent change, a merged peer entry, an absorbed account, a region or policy change — invalidates the cached `GateSnapshot`, so `decision(for:)` re-evaluates on the next call: a revocation recorded locally closes the gate immediately, publish or no publish (`testDecisionReflectsEveryMutationWithoutAPublish`).
 Two devices publishing "version 3" is exactly the collision that makes last-writer-wins wrong. `GateSnapshot.producedAt` is an HLC timestamp; the backend (`InMemoryGateServer` is the reference) rejects anything older than what it holds, and a rejected device folds the server's timestamp into its own clock so it can publish again. `ConsentOrchestrator.evaluateAndPublish` mints the snapshot *before* its first `await`, so overlapping calls never regress local state; transport failures retry on an injectable schedule, and a failed publish never re-opens a gate that closed locally.
 
 **8. No trapping arithmetic reachable from the public API.**
@@ -67,7 +68,7 @@ Every counter goes through `addingSaturating` / `multipliedSaturating`; `WallClo
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/rajatslakhina/consent-ledger-kit.git", from: "1.0.0")
+    .package(url: "https://github.com/rajatslakhina/consent-ledger-kit.git", from: "1.0.2")
 ]
 ```
 
@@ -96,17 +97,17 @@ Features import `CapabilityGate`'s decision. They never import an age.
 
 This section is written against what actually ran, not what should have.
 
-- **Linux, Swift 6.0.3:** `rm -rf .build && swift build -Xswiftc -warnings-as-errors` → `Build complete!` with zero warnings; `swift build --build-tests -Xswiftc -warnings-as-errors && swift test` → **69 tests, 0 failures** across `PrimitiveTests` (15), `ReconciliationTests` (10), `LedgerTests` (20), `GateTests` (8), `OrchestratorTests` (10), `AuditTests` (6).
+- **Linux, Swift 6.0.3:** `rm -rf .build && swift build -Xswiftc -warnings-as-errors` → `Build complete!` with zero warnings; `swift build --build-tests -Xswiftc -warnings-as-errors && swift test` → **70 tests, 0 failures** across `PrimitiveTests` (15), `ReconciliationTests` (10), `LedgerTests` (20), `GateTests` (8), `OrchestratorTests` (11), `AuditTests` (6).
 - **Negative controls in the suite:** `ConvergenceAudit` must *fail* on `arrivalOrderFold`; `FailClosedAudit` must *fail* on the optimistic evaluator and on a "we'll ask later" consent bypass; a same-instant grant/revoke must fold to revoked with the node names in either order; a merge past `hardCapacity` must throw and leave the ledger untouched; a publish held open across a real suspension while the state changes must come back `staleVersion`, never overtake the newer snapshot.
 - **CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the Linux job above on every push (warnings-as-errors is enforced there, not asserted in prose) and a macOS job that compiles `ConsentLedgerUI` for `generic/platform=iOS Simulator`. The Actions tab is the source of truth for the current status.
-- **Simulator:** this package contains no app. The companion demo repo states, separately, whether its app was *built* for a Simulator and whether it was *run* on one.
+- **Simulator:** this package contains no app. The companion demo app was **built** for `generic/platform=iOS Simulator` by its CI, but it was **not run** on a Simulator during the scheduled run that produced these repos — `request_access` to Xcode/Simulator was refused three times ("can't be approved during a scheduled run"), so no screenshots exist anywhere. The demo README carries the verbatim refusal.
 
 ## Layout
 
 ```
 Sources/ConsentLedger/       Primitives · AgeSignal · ConsentStateMachine · Ledger · CapabilityGate · Propagation · ConsentOrchestrator · Audit
 Sources/ConsentLedgerUI/     ConsentOrchestrationDemoView (SwiftUI; empty target on Linux)
-Tests/ConsentLedgerTests/    69 XCTest cases, including the negative controls above
+Tests/ConsentLedgerTests/    70 XCTest cases, including the negative controls above
 ```
 
 No executable target. The runnable app lives in the companion repo and consumes this package as a version-pinned remote dependency.
