@@ -1,0 +1,262 @@
+import XCTest
+@testable import ConsentLedger
+
+final class OrchestratorTests: XCTestCase {
+    private let g = Fixtures.guardian
+
+    private func makeDevice(
+        node: Identifier,
+        clock: ManualClock,
+        server: GatePropagator,
+        providers: [AgeSignalProvider] = [],
+        region: Identifier? = Fixtures.uk,
+        retry: RetryPolicy = .standard,
+        sleeper: Sleeper = RecordingSleeper(),
+        limits: Ledger.Limits = .standard
+    ) -> ConsentOrchestrator {
+        let configuration = OrchestratorConfiguration(
+            node: node, account: Fixtures.account, policy: Fixtures.policy, region: region,
+            ledgerLimits: limits, retry: retry
+        )
+        return ConsentOrchestrator(configuration: configuration, providers: providers, propagator: server, sleeper: sleeper, now: clock.reader)
+    }
+
+    // MARK: Fail closed by default
+
+    func testFreshDeviceDeniesEverythingBeforeAnyEvaluation() async {
+        let clock = ManualClock(1_000_000)
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: InMemoryGateServer())
+        for capability in Capability.standardSet {
+            let decision = await device.decision(for: capability)
+            XCTAssertEqual(decision, .denied(.ageUnknown))
+        }
+    }
+
+    // MARK: Two devices converge
+
+    func testChildAndGuardianConvergeAfterSyncAndServerHoldsNewest() async throws {
+        let clock = ManualClock(1_000_000)
+        let server = InMemoryGateServer()
+        let child = makeDevice(node: Fixtures.childNode, clock: clock, server: server)
+        let guardian = makeDevice(node: Fixtures.guardianNode, clock: clock, server: server)
+
+        try await child.observe(source: .declaredRange, bracket: .thirteenToFifteen)
+        try await child.requestConsent(from: g, scope: .all)
+        clock.advance(10)
+        _ = await child.evaluateAndPublish()
+        var status = await child.status
+        XCTAssertEqual(status.snapshot.decision(for: Capability.chat.id), .denied(.consentPending))
+
+        // Guardian device knows nothing yet: it cannot even see an age.
+        let guardianBefore = await guardian.status
+        XCTAssertNil(guardianBefore.age.conservative)
+
+        // Sync child → guardian, guardian grants, sync back.
+        let fromChild = await child.exportEntries()
+        try await guardian.importEntries(fromChild)
+        let afterImport = await guardian.status
+        XCTAssertEqual(afterImport.age.conservative, .thirteenToFifteen, "age evidence travels with the ledger")
+        try await guardian.grantConsent(guardian: g, scope: .all)
+        let fromGuardian = await guardian.exportEntries()
+        try await child.importEntries(fromGuardian)
+
+        clock.advance(10)
+        _ = await child.evaluateAndPublish()
+        status = await child.status
+        XCTAssertEqual(status.snapshot.decision(for: Capability.chat.id), .allowed(consentBy: g))
+        XCTAssertEqual(status.consent.phase, .consentGranted)
+
+        let guardianStatus = await guardian.status
+        XCTAssertEqual(guardianStatus.consent, status.consent, "both replicas fold to the same state")
+
+        let held = await server.snapshot(for: Fixtures.account)
+        XCTAssertEqual(held?.decision(for: Capability.chat.id), .allowed(consentBy: g))
+    }
+
+    func testServerRejectsOlderSnapshotFromSecondDevice() async throws {
+        let clock = ManualClock(5_000)
+        let server = InMemoryGateServer()
+        let child = makeDevice(node: Fixtures.childNode, clock: clock, server: server)
+        let guardian = makeDevice(node: Fixtures.guardianNode, clock: clock, server: server)
+
+        // Guardian's clock has raced ahead by importing a far-future timestamp.
+        try await guardian.importEntries([Fixtures.entry(1, node: "far", at: 9_000, .ageDeclared(.adult))])
+        let ahead = await guardian.evaluateAndPublish()
+        guard case .success = ahead else { return XCTFail("\(ahead)") }
+
+        let behind = await child.evaluateAndPublish()
+        guard case .failure(let error) = behind, case .staleVersion = error else { return XCTFail("\(behind)") }
+        let childStatus = await child.status
+        XCTAssertNil(childStatus.lastAcknowledged)
+        XCTAssertNil(childStatus.lastPropagationError, "stale is not an error to retry")
+
+        // After the child syncs, its clock has caught up and its publish wins.
+        try await child.importEntries(await guardian.exportEntries())
+        let caughtUp = await child.evaluateAndPublish()
+        guard case .success = caughtUp else { return XCTFail("\(caughtUp)") }
+    }
+
+    // MARK: Retry
+
+    func testTransportFailureRetriesWithScheduleAndGivesUp() async throws {
+        let clock = ManualClock(1_000)
+        let server = InMemoryGateServer()
+        let sleeper = RecordingSleeper()
+        let retry = RetryPolicy(maximumAttempts: 3, backoffMilliseconds: [10, 20])
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: server, retry: retry, sleeper: sleeper)
+
+        await server.failNext(2)
+        let result = await device.evaluateAndPublish()
+        guard case .success = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(sleeper.delays, [10, 20])
+        let awaited1 = await server.publishCount
+        XCTAssertEqual(awaited1, 3)
+
+        await server.failNext(10)
+        clock.advance(1)
+        let exhausted = await device.evaluateAndPublish()
+        guard case .failure(.transport) = exhausted else { return XCTFail("\(exhausted)") }
+        XCTAssertEqual(sleeper.delays, [10, 20, 10, 20], "maximumAttempts bounds the loop")
+        let status = await device.status
+        XCTAssertEqual(status.lastPropagationError, "simulated outage")
+        XCTAssertEqual(status.snapshot.decision(for: Capability.chat.id), .denied(.ageUnknown), "local decision unaffected by transport")
+    }
+
+    // MARK: Providers
+
+    func testProviderSignalsAreReconciledAndTransportErrorsCollected() async throws {
+        let clock = ManualClock(2_000_000)
+        struct Boom: Error {}
+        let declared = ClosureAgeSignalProvider(source: .declaredRange) {
+            AgeSignal(source: .declaredRange, bracket: .under13, observedAt: Fixtures.stamp(2_000_000, node: "sys"))
+        }
+        let serverAge = ClosureAgeSignalProvider(source: .serverAccountAge) {
+            AgeSignal(source: .serverAccountAge, bracket: .adult, observedAt: Fixtures.stamp(2_000_000, node: "api"))
+        }
+        let broken = ClosureAgeSignalProvider(source: .guardianAttestation) { throw Boom() }
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: InMemoryGateServer(), providers: [declared, serverAge, broken])
+
+        let errors = await device.refreshSignals()
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertNotNil(errors[.guardianAttestation])
+        let status = await device.status
+        XCTAssertEqual(status.age.conservative, .under13, "disagreement → youngest")
+        XCTAssertEqual(status.age.disagreements.count, 1)
+        XCTAssertEqual(status.consent.phase, .verified, "signals were appended to the ledger")
+        XCTAssertEqual(status.ledgerTailCount, 2)
+
+        // Polling again with identical signals appends nothing (dedup by timestamp).
+        _ = await device.refreshSignals()
+        let awaited2 = await device.status.ledgerTailCount
+        XCTAssertEqual(awaited2, 2)
+    }
+
+    // MARK: Compaction gated on acknowledgement
+
+    func testCompactionRequiresPeerAcknowledgement() async throws {
+        let clock = ManualClock(1_000)
+        let device = makeDevice(
+            node: Fixtures.childNode, clock: clock, server: InMemoryGateServer(),
+            limits: .init(compactionThreshold: 2, hardCapacity: 100)
+        )
+        try await device.observe(source: .declaredRange, bracket: .under13)
+        try await device.requestConsent(from: g, scope: .all)
+        try await device.requestConsent(from: Fixtures.otherGuardian, scope: .all)
+        let awaited3 = await device.status.ledgerTailCount
+        XCTAssertEqual(awaited3, 3)
+        let awaited4 = await device.compactIfSafe()
+        XCTAssertFalse(awaited4, "nothing acknowledged yet")
+
+        let exported = await device.exportEntries()
+        await device.acknowledge(Array(exported.map(\.id).prefix(2)))
+        let awaited5 = await device.compactIfSafe()
+        XCTAssertFalse(awaited5, "partial acknowledgement is not enough")
+
+        await device.acknowledge(exported.map(\.id))
+        let awaited6 = await device.compactIfSafe()
+        XCTAssertTrue(awaited6)
+        let awaited7 = await device.status.ledgerTailCount
+        XCTAssertEqual(awaited7, 0)
+        let awaited8 = await device.status.consent.phase
+        XCTAssertEqual(awaited8, .consentPending, "state survives compaction")
+    }
+
+    // MARK: Account merge through the orchestrator
+
+    func testAbsorbGuestLedgerClosesRevokedCapability() async throws {
+        let clock = ManualClock(10_000)
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: InMemoryGateServer(), region: Fixtures.uk)
+        try await device.observe(source: .declaredRange, bracket: .thirteenToFifteen)
+        try await device.grantConsent(guardian: g, scope: .all)
+        clock.advance(1)
+        _ = await device.evaluateAndPublish()
+        let awaited9 = await device.decision(for: .chat)
+        XCTAssertEqual(awaited9, .allowed(consentBy: g))
+
+        var guest = Ledger(account: "guest")
+        try guest.merge(entries: [
+            LedgerEntry(id: EntryID(node: "gd", sequence: 1), account: "guest", timestamp: Fixtures.stamp(9_000, node: "gd"), kind: .ageDeclared(.thirteenToFifteen)),
+            LedgerEntry(id: EntryID(node: "gd", sequence: 2), account: "guest", timestamp: Fixtures.stamp(9_500, node: "gd"),
+                        kind: .consentRevoked(guardian: Fixtures.otherGuardian, scope: .capabilities([Capability.chat.id])))
+        ])
+        try await device.absorb(guest)
+        clock.advance(1)
+        _ = await device.evaluateAndPublish()
+        let awaited10 = await device.decision(for: .chat)
+        XCTAssertEqual(awaited10, .denied(.consentRevoked))
+        let awaited11 = await device.decision(for: .userGeneratedContent)
+        XCTAssertEqual(awaited11, .allowed(consentBy: g))
+        let awaited12 = await device.status.consent.mergedAccounts
+        XCTAssertEqual(awaited12, ["guest"])
+    }
+
+    // MARK: Region and policy
+
+    func testRegionChangeAndMonotonePolicyUpdateAffectDecisions() async throws {
+        let clock = ManualClock(10_000)
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: InMemoryGateServer(), region: Fixtures.us)
+        try await device.observe(source: .declaredRange, bracket: .thirteenToFifteen)
+        _ = await device.evaluateAndPublish()
+        let awaited13 = await device.decision(for: .chat)
+        XCTAssertEqual(awaited13, .allowed(consentBy: nil))
+
+        await device.setRegion(nil)
+        clock.advance(1)
+        _ = await device.evaluateAndPublish()
+        let awaited14 = await device.decision(for: .chat)
+        XCTAssertEqual(awaited14, .denied(.consentRequired), "unknown region is strictest")
+
+        await device.setRegion(Fixtures.us)
+        await device.applyPolicyUpdate(JurisdictionPolicy(
+            version: 99, rules: [Fixtures.us: [Capability.chat.id: CapabilityRule(minimumAge: 16, guardianConsentBelow: nil)]],
+            baseline: Fixtures.policy.baseline
+        ))
+        clock.advance(1)
+        _ = await device.evaluateAndPublish()
+        let awaited15 = await device.decision(for: .chat)
+        XCTAssertEqual(awaited15, .denied(.belowMinimumAge))
+        let awaited16 = await device.activePolicy.version
+        XCTAssertEqual(awaited16, 99)
+    }
+
+    // MARK: Concurrency
+
+    func testConcurrentPublishesMintDistinctIncreasingVersionsAndNeverRegress() async throws {
+        let clock = ManualClock(1_000)
+        let server = InMemoryGateServer()
+        let device = makeDevice(node: Fixtures.childNode, clock: clock, server: server)
+        try await device.observe(source: .declaredRange, bracket: .adult)
+
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<16 {
+                group.addTask { _ = await device.evaluateAndPublish() }
+            }
+        }
+        let status = await device.status
+        XCTAssertEqual(status.snapshot.version, 16)
+        let held = await server.snapshot(for: Fixtures.account)
+        XCTAssertEqual(held?.version, 16, "the server holds the newest, whichever order acks landed")
+        let awaited17 = await server.publishCount
+        XCTAssertEqual(awaited17, 16)
+    }
+}
