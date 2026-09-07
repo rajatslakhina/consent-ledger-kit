@@ -253,17 +253,19 @@ public enum AgeSignalReconciler {
             return ReconciledAge(attested: top, conservative: top.bracket, disagreements: disagreements, staleSources: stale)
         }
 
+        // A disagreement is a fresh source whose bracket is disjoint from the
+        // highest-trust one; attribution is always (top, lower). The running
+        // intersection is tracked separately so a collapse caused by one
+        // source does not get charged to the sources after it.
         var intersection: AgeBracket? = top.bracket
         var disagreements: [AgeDisagreement] = []
         var youngest = top.bracket
         for lower in fresh.dropFirst() {
             if lower.bracket.lowerBound < youngest.lowerBound { youngest = lower.bracket }
-            if let current = intersection, let next = current.intersection(lower.bracket) {
-                intersection = next
-            } else {
-                intersection = nil
+            if top.bracket.intersection(lower.bracket) == nil {
                 disagreements.append(AgeDisagreement(higherTrust: top, lowerTrust: lower))
             }
+            intersection = intersection.flatMap { $0.intersection(lower.bracket) }
         }
         return ReconciledAge(
             attested: top,

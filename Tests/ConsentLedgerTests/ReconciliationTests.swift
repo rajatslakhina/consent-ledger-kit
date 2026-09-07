@@ -59,6 +59,25 @@ final class ReconciliationTests: XCTestCase {
         XCTAssertEqual(result.disagreements.count, 1, "the device disagreement is still reported")
     }
 
+    /// Server and guardian both disagree with the device; the two
+    /// disagreements are attributed to the top source, and a source that
+    /// overlaps the top one is not charged for a collapse caused by another.
+    func testDisagreementAttributionIsAlwaysAgainstTopSource() throws {
+        let device = Fixtures.signal(.declaredRange, .under13, at: now)
+        let server = Fixtures.signal(.serverAccountAge, .adult, at: now)
+        let result = AgeSignalReconciler.reconcile([device, server], policy: policy, nowMilliseconds: now)
+        XCTAssertEqual(result.disagreements.map(\.higherTrust.source), [.serverAccountAge])
+        XCTAssertEqual(result.disagreements.map(\.lowerTrust.source), [.declaredRange])
+
+        // Top = server 13–15; device 10–15 overlaps the top but not... itself
+        // is fine; a three-way where only the device is disjoint must report 1.
+        let wide = Fixtures.signal(.declaredRange, .under13, at: now)
+        let teenServer = Fixtures.signal(.serverAccountAge, .thirteenToFifteen, at: now)
+        let three = AgeSignalReconciler.reconcile([wide, teenServer], policy: policy, nowMilliseconds: now)
+        XCTAssertEqual(three.disagreements.count, 1)
+        XCTAssertEqual(three.conservative, .under13)
+    }
+
     func testStaleSignalDoesNotOpenAGateButIsReported() {
         let staleServer = Fixtures.signal(.serverAccountAge, .adult, at: now - policy.maximumAgeMilliseconds[.serverAccountAge, default: 0] - 1)
         let freshDevice = Fixtures.signal(.declaredRange, .under13, at: now)

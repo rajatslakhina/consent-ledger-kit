@@ -256,10 +256,10 @@ public struct ConsentOrchestrationDemoView: View {
                     HStack {
                         Text(capability.displayName)
                         Spacer()
-                        decisionLabel(status.snapshot.decision(for: capability.id))
+                        decisionLabel(status.decision(for: capability.id))
                     }
                 }
-                LabeledContent("Ledger tail", value: "\(status.ledgerTailCount) entries · v\(status.snapshot.version)")
+                LabeledContent("Ledger tail", value: "\(status.ledgerTailCount) entries · published v\(status.lastPublished.map { String($0.version) } ?? "—")")
                 if let error = status.lastPropagationError {
                     Text("Propagation: \(error)").font(.footnote).foregroundStyle(.red)
                 }

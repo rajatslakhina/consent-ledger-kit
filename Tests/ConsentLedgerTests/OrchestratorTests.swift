@@ -37,17 +37,17 @@ final class OrchestratorTests: XCTestCase {
     func testDecisionReflectsEveryMutationWithoutAPublish() async throws {
         let clock = ManualClock(10_000)
         let device = makeDevice(node: Fixtures.childNode, clock: clock, server: InMemoryGateServer(), region: Fixtures.uk)
-        _ = await device.evaluateAndPublish() // caches an ageUnknown snapshot
+        _ = await device.evaluateAndPublish() // publishes an ageUnknown snapshot; must not be served back
         var decision = await device.decision(for: .chat)
         XCTAssertEqual(decision, .denied(.ageUnknown))
 
         try await device.observe(source: .declaredRange, bracket: .thirteenToFifteen)
         decision = await device.decision(for: .chat)
-        XCTAssertEqual(decision, .denied(.consentRequired), "observe invalidates")
+        XCTAssertEqual(decision, .denied(.consentRequired), "observe is reflected")
 
         try await device.grantConsent(guardian: g, scope: .all)
         decision = await device.decision(for: .chat)
-        XCTAssertEqual(decision, .allowed(consentBy: g), "grant invalidates")
+        XCTAssertEqual(decision, .allowed(consentBy: g), "grant is reflected")
 
         try await device.revokeConsent(guardian: g, scope: .all)
         decision = await device.decision(for: .chat)
@@ -56,14 +56,14 @@ final class OrchestratorTests: XCTestCase {
         try await device.grantConsent(guardian: g, scope: .all)
         await device.setRegion(Fixtures.us)
         decision = await device.decision(for: .chat)
-        XCTAssertEqual(decision, .allowed(consentBy: nil), "region change invalidates (US chat needs no consent)")
+        XCTAssertEqual(decision, .allowed(consentBy: nil), "region change is reflected (US chat needs no consent)")
 
         await device.applyPolicyUpdate(JurisdictionPolicy(
             version: 2, rules: [Fixtures.us: [Capability.chat.id: CapabilityRule(minimumAge: 16, guardianConsentBelow: nil)]],
             baseline: Fixtures.policy.baseline
         ))
         decision = await device.decision(for: .chat)
-        XCTAssertEqual(decision, .denied(.belowMinimumAge), "policy update invalidates")
+        XCTAssertEqual(decision, .denied(.belowMinimumAge), "policy update is reflected")
 
         // A peer's revocation merged via importEntries closes immediately too.
         await device.setRegion(Fixtures.uk)
@@ -72,7 +72,43 @@ final class OrchestratorTests: XCTestCase {
                                      kind: .consentRevoked(guardian: Fixtures.otherGuardian, scope: .capabilities([Capability.chat.id])))
         try await device.importEntries([peerRevoke])
         decision = await device.decision(for: .chat)
-        XCTAssertEqual(decision, .denied(.consentRevoked), "importEntries invalidates")
+        XCTAssertEqual(decision, .denied(.consentRevoked), "importEntries is reflected")
+
+        // absorb: a guest account whose guardian attested *under 13*. The
+        // age evidence must reach the gate, not just the folded state.
+        await device.setRegion(Fixtures.us)
+        var guest = Ledger(account: "guest")
+        try guest.merge(entries: [
+            LedgerEntry(id: EntryID(node: "gd", sequence: 1), account: "guest", timestamp: Fixtures.stamp(5_000, node: "gd"),
+                        kind: .ageVerified(.under13, source: .guardianAttestation))
+        ])
+        decision = await device.decision(for: .purchases)
+        XCTAssertEqual(decision, .allowed(consentBy: nil), "before the merge, 13–15 clears the US baseline")
+        try await device.absorb(guest)
+        decision = await device.decision(for: .purchases)
+        XCTAssertEqual(decision, .denied(.belowMinimumAge), "absorb feeds the reconciler: the guardian attestation says under 13")
+
+        // refreshSignals: a provider answer is reflected without a publish.
+        // (Constructed on a second device so the provider is the only input.)
+        let older = ClosureAgeSignalProvider(source: .serverAccountAge) {
+            AgeSignal(source: .serverAccountAge, bracket: .adult, observedAt: Fixtures.stamp(9_000, node: "api"))
+        }
+        let second = makeDevice(node: Fixtures.guardianNode, clock: clock, server: InMemoryGateServer(), providers: [older], region: Fixtures.us)
+        _ = await second.evaluateAndPublish()
+        var other = await second.decision(for: .purchases)
+        XCTAssertEqual(other, .denied(.ageUnknown))
+        _ = await second.refreshSignals()
+        other = await second.decision(for: .purchases)
+        XCTAssertEqual(other, .allowed(consentBy: nil), "refreshSignals is reflected")
+
+        // Time: once the only signal ages past its freshness window, the gate
+        // closes with no mutation at all.
+        clock.advance(ReconciliationPolicy.standard.maximumAgeMilliseconds[.serverAccountAge, default: 0].addingSaturating(1))
+        other = await second.decision(for: .purchases)
+        XCTAssertEqual(other, .denied(.ageUnknown), "a stale signal closes the gate by the clock alone")
+        let status = await second.status
+        XCTAssertEqual(status.age.staleSources, [.serverAccountAge])
+        XCTAssertEqual(status.decision(for: Capability.purchases.id), .denied(.ageUnknown), "status.decisions agrees with decision(for:)")
     }
 
     // MARK: Two devices converge
@@ -88,7 +124,7 @@ final class OrchestratorTests: XCTestCase {
         clock.advance(10)
         _ = await child.evaluateAndPublish()
         var status = await child.status
-        XCTAssertEqual(status.snapshot.decision(for: Capability.chat.id), .denied(.consentPending))
+        XCTAssertEqual(status.decision(for: Capability.chat.id), .denied(.consentPending))
 
         // Guardian device knows nothing yet: it cannot even see an age.
         let guardianBefore = await guardian.status
@@ -106,7 +142,7 @@ final class OrchestratorTests: XCTestCase {
         clock.advance(10)
         _ = await child.evaluateAndPublish()
         status = await child.status
-        XCTAssertEqual(status.snapshot.decision(for: Capability.chat.id), .allowed(consentBy: g))
+        XCTAssertEqual(status.decision(for: Capability.chat.id), .allowed(consentBy: g))
         XCTAssertEqual(status.consent.phase, .consentGranted)
 
         let guardianStatus = await guardian.status
@@ -162,7 +198,7 @@ final class OrchestratorTests: XCTestCase {
         XCTAssertEqual(sleeper.delays, [10, 20, 10, 20], "maximumAttempts bounds the loop")
         let status = await device.status
         XCTAssertEqual(status.lastPropagationError, "simulated outage")
-        XCTAssertEqual(status.snapshot.decision(for: Capability.chat.id), .denied(.ageUnknown), "local decision unaffected by transport")
+        XCTAssertEqual(status.decision(for: Capability.chat.id), .denied(.ageUnknown), "local decision unaffected by transport")
     }
 
     // MARK: Providers
@@ -305,7 +341,7 @@ final class OrchestratorTests: XCTestCase {
             XCTAssertLessThan(pair.0.producedAt, pair.1.producedAt, "version order and HLC order agree")
         }
         let status = await device.status
-        XCTAssertEqual(status.snapshot.version, 16)
+        XCTAssertEqual(status.lastPublished?.version, 16)
         let held = await server.snapshot(for: Fixtures.account)
         XCTAssertEqual(held?.producedAt, byVersion.last?.producedAt, "the server holds the newest, whichever order acks landed")
     }

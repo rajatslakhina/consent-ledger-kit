@@ -38,10 +38,20 @@ public struct OrchestratorConfiguration: Sendable {
 public struct OrchestratorStatus: Sendable, Hashable {
     public let age: ReconciledAge
     public let consent: ConsentState
-    public let snapshot: GateSnapshot
+    /// Fresh decisions, computed from the current state and the current
+    /// time at the moment of the read — never a cache.
+    public let decisions: [Identifier: GateDecision]
+    /// The last snapshot minted for publication, if any. Publication is the
+    /// only thing this is for; reading gates goes through `decisions`.
+    public let lastPublished: GateSnapshot?
     public let ledgerTailCount: Int
     public let lastAcknowledged: HybridTimestamp?
     public let lastPropagationError: String?
+
+    /// Fail closed for anything not in `decisions`.
+    public func decision(for capability: Identifier) -> GateDecision {
+        decisions[capability] ?? .denied(.ageUnknown)
+    }
 }
 
 // MARK: - Orchestrator
@@ -61,11 +71,13 @@ public struct OrchestratorStatus: Sendable, Hashable {
 /// signal with a strictly newer one; the ack bookkeeping after a publish
 /// folds with `max` and only clears the error for the newest snapshot.
 ///
-/// Freshness contract: every mutation (`observe`, consent changes,
-/// `importEntries`, `absorb`, `setRegion`, `applyPolicyUpdate`, ingested
-/// signals) invalidates the cached snapshot, so `decision(for:)` never
-/// answers from a snapshot older than the last mutation — a locally recorded
-/// revocation closes the gate on the very next call, publish or no publish.
+/// Freshness contract: `decision(for:)` and `status.decisions` are
+/// *computed*, not cached — from the ledger, the signal cache, the region,
+/// the policy and the current time, on every call. A locally recorded
+/// revocation closes the gate on the very next read, publish or no publish,
+/// and a signal that ages past its freshness window closes it the moment
+/// the clock says so. The only cached snapshot is `lastPublished`, and it
+/// is only ever used for publication.
 public actor ConsentOrchestrator {
     public let configuration: OrchestratorConfiguration
 
@@ -76,10 +88,9 @@ public actor ConsentOrchestrator {
     private var policy: JurisdictionPolicy
     private var region: Identifier?
     private var gateVersion: UInt64 = 0
-    /// The last minted snapshot, or `nil` when a mutation has happened since
-    /// it was minted. `decision(for:)` re-mints on `nil`, so a stale snapshot
-    /// can never be served after a gate-closing change.
-    private var currentSnapshot: GateSnapshot?
+    /// The last snapshot minted for publication. Never consulted for a gate
+    /// decision.
+    private var lastPublished: GateSnapshot?
     private var lastAcknowledged: HybridTimestamp?
     private var lastPropagationError: String?
     /// Entry IDs the sync layer has confirmed a peer holds. Compaction is
@@ -114,31 +125,29 @@ public actor ConsentOrchestrator {
     public var status: OrchestratorStatus {
         let age = reconciledAge()
         let consent = ledger.fold()
-        let snapshot = currentSnapshot ?? CapabilityGate.snapshot(
-            capabilities: configuration.capabilities,
-            age: age,
-            consent: consent,
-            region: region,
-            policy: policy,
-            version: gateVersion,
-            producedAt: HybridTimestamp(wallMilliseconds: clock.lastWall, logical: clock.lastLogical, node: configuration.node)
-        )
         return OrchestratorStatus(
             age: age,
             consent: consent,
-            snapshot: snapshot,
+            decisions: decisions(age: age, consent: consent),
+            lastPublished: lastPublished,
             ledgerTailCount: ledger.tailCount,
             lastAcknowledged: lastAcknowledged,
             lastPropagationError: lastPropagationError
         )
     }
 
-    /// The decision every feature asks for. Reads the last evaluated
-    /// snapshot; if nothing has been evaluated yet, evaluates now (without
-    /// publishing). Never returns "allowed" by default.
+    /// The decision every feature asks for. Computed fresh on every call.
+    /// Never returns "allowed" by default.
     public func decision(for capability: Capability) -> GateDecision {
-        if let currentSnapshot { return currentSnapshot.decision(for: capability.id) }
-        return evaluateLocally().decision(for: capability.id)
+        CapabilityGate.evaluate(capability, age: reconciledAge(), consent: ledger.fold(), region: region, policy: policy)
+    }
+
+    private func decisions(age: ReconciledAge, consent: ConsentState) -> [Identifier: GateDecision] {
+        var result: [Identifier: GateDecision] = [:]
+        for capability in configuration.capabilities {
+            result[capability.id] = CapabilityGate.evaluate(capability, age: age, consent: consent, region: region, policy: policy)
+        }
+        return result
     }
 
     public var ledgerSnapshot: Ledger { ledger }
@@ -182,7 +191,6 @@ public actor ConsentOrchestrator {
         clock.receive(signal.observedAt, nowMilliseconds: now())
         if let existing = signals[signal.source], existing.observedAt >= signal.observedAt { return }
         signals[signal.source] = signal
-        currentSnapshot = nil
         guard appending else { return }
         let kind: ConsentEventKind = signal.source == .declaredRange
             ? .ageDeclared(signal.bracket)
@@ -214,7 +222,6 @@ public actor ConsentOrchestrator {
             kind: kind
         )
         try ledger.append(entry)
-        currentSnapshot = nil
     }
 
     // MARK: Sync
@@ -233,7 +240,6 @@ public actor ConsentOrchestrator {
     public func importEntries(_ entries: [LedgerEntry]) throws {
         for entry in entries { clock.receive(entry.timestamp, nowMilliseconds: now()) }
         try ledger.merge(entries: entries)
-        currentSnapshot = nil
         for entry in entries {
             switch entry.kind {
             case .ageDeclared(let bracket):
@@ -276,21 +282,35 @@ public actor ConsentOrchestrator {
             kind: .accountMerged(from: other.account)
         )
         let report = try ledger.absorb(other, mergedAt: marker)
-        currentSnapshot = nil
+        // Age evidence from the absorbed account feeds the reconciler exactly
+        // as it does on `importEntries`: the gate reads signals, not the
+        // folded state, so a younger or higher-trust bracket carried by the
+        // guest must reach the gate too.
+        let otherState = other.snapshot.state
+        if let bracket = otherState.declaredBracket, let at = otherState.declaredAt {
+            try ingest(AgeSignal(source: .declaredRange, bracket: bracket, observedAt: at), appending: false)
+        }
+        if let bracket = otherState.verifiedBracket, let source = otherState.verifiedBy, let at = otherState.verifiedAt {
+            try ingest(AgeSignal(source: source, bracket: bracket, observedAt: at), appending: false)
+        }
+        for entry in other.tail.values {
+            switch entry.kind {
+            case .ageDeclared(let bracket):
+                try ingest(AgeSignal(source: .declaredRange, bracket: bracket, observedAt: entry.timestamp), appending: false)
+            case let .ageVerified(bracket, source):
+                try ingest(AgeSignal(source: source, bracket: bracket, observedAt: entry.timestamp), appending: false)
+            default:
+                continue
+            }
+        }
         return report
     }
 
     // MARK: Policy / region
 
-    public func setRegion(_ region: Identifier?) {
-        self.region = region
-        currentSnapshot = nil
-    }
+    public func setRegion(_ region: Identifier?) { self.region = region }
 
-    public func applyPolicyUpdate(_ update: JurisdictionPolicy) {
-        policy = policy.applying(update: update)
-        currentSnapshot = nil
-    }
+    public func applyPolicyUpdate(_ update: JurisdictionPolicy) { policy = policy.applying(update: update) }
 
     public var activePolicy: JurisdictionPolicy { policy }
 
@@ -300,32 +320,27 @@ public actor ConsentOrchestrator {
         AgeSignalReconciler.reconcile(Array(signals.values), policy: configuration.reconciliation, nowMilliseconds: now())
     }
 
-    /// Mints the next snapshot version synchronously.
+    /// Mints the next snapshot for publication, synchronously. Versions are
+    /// strictly increasing and the HLC stamp is ticked per mint.
     @discardableResult
     private func evaluateLocally() -> GateSnapshot {
         gateVersion = gateVersion.addingSaturating(1)
-        let snapshot = CapabilityGate.snapshot(
-            capabilities: configuration.capabilities,
-            age: reconciledAge(),
-            consent: ledger.fold(),
-            region: region,
-            policy: policy,
+        let age = reconciledAge()
+        let consent = ledger.fold()
+        let snapshot = GateSnapshot(
             version: gateVersion,
-            producedAt: clock.tick(nowMilliseconds: now())
+            producedAt: clock.tick(nowMilliseconds: now()),
+            policyVersion: policy.version,
+            region: region,
+            decisions: decisions(age: age, consent: consent)
         )
-        if let current = currentSnapshot, current.version >= snapshot.version {
-            // Unreachable while versions are minted here; kept as the
-            // invariant's guard rather than trusting the comment.
-            return current
-        }
-        currentSnapshot = snapshot
+        lastPublished = snapshot
         return snapshot
     }
 
-    /// Evaluates every gate, stores the snapshot locally, then pushes it to
-    /// the backend with bounded retries. The local decision is live the
-    /// moment this method is entered; propagation failure never re-opens a
-    /// gate that was closed locally.
+    /// Mints a snapshot of every gate and pushes it to the backend with
+    /// bounded retries. Local decisions never depend on this: they are
+    /// computed on read. Propagation failure never re-opens a gate.
     @discardableResult
     public func evaluateAndPublish() async -> Result<PropagationAck, PropagationError> {
         let snapshot = evaluateLocally()
@@ -337,7 +352,7 @@ public actor ConsentOrchestrator {
                 // Only the ack for the *newest* minted snapshot may clear the
                 // error: an older publish resolving after a newer one failed
                 // must not hide that failure (actor reentrancy across the await).
-                if let current = currentSnapshot, ack.accepted >= current.producedAt { lastPropagationError = nil }
+                if let current = lastPublished, ack.accepted >= current.producedAt { lastPropagationError = nil }
                 return .success(ack)
             } catch let error as PropagationError {
                 switch error {

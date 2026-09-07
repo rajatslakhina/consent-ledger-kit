@@ -134,6 +134,9 @@ public enum LedgerError: Error, Hashable, Sendable {
     case entryPredatesSnapshot(EntryID)
     /// The entry belongs to a different account and no merge was declared.
     case foreignAccount(expected: Identifier, actual: Identifier)
+    /// `absorb` was given a marker that is not an `accountMerged` fact for
+    /// the ledger being absorbed.
+    case markerMismatch(expectedSource: Identifier, marker: ConsentEventKind)
     /// An absorbed entry's timestamp is outside the range for which synthetic
     /// IDs are unique (see `EntryID.synthetic(for:)`); absorbing it could
     /// silently discard another decision, so the whole absorb is refused.
@@ -234,8 +237,11 @@ public struct Ledger: Hashable, Sendable, Codable {
     /// history, see `AbsorbReport` for the fail-closed rule applied.
     @discardableResult
     public mutating func absorb(_ other: Ledger, mergedAt marker: LedgerEntry) throws -> AbsorbReport {
-        guard marker.account == account, case .accountMerged(let from) = marker.kind, from == other.account else {
+        guard marker.account == account else {
             throw LedgerError.foreignAccount(expected: account, actual: marker.account)
+        }
+        guard case .accountMerged(let from) = marker.kind, from == other.account else {
+            throw LedgerError.markerMismatch(expectedSource: other.account, marker: marker.kind)
         }
         var facts: [(timestamp: HybridTimestamp, kind: ConsentEventKind)] = []
         let otherState = other.snapshot.state

@@ -256,7 +256,16 @@ final class LedgerTests: XCTestCase {
         let guest = Ledger(account: "guest")
         let wrong = Fixtures.entry(1, at: 1, .accountMerged(from: "not-guest"))
         XCTAssertThrowsError(try main.absorb(guest, mergedAt: wrong)) { error in
-            XCTAssertEqual(error as? LedgerError, .foreignAccount(expected: Fixtures.account, actual: Fixtures.account))
+            XCTAssertEqual(error as? LedgerError, .markerMismatch(expectedSource: "guest", marker: .accountMerged(from: "not-guest")))
+        }
+        let notAMarker = Fixtures.entry(1, at: 1, .ageDeclared(.adult))
+        XCTAssertThrowsError(try main.absorb(guest, mergedAt: notAMarker)) { error in
+            XCTAssertEqual(error as? LedgerError, .markerMismatch(expectedSource: "guest", marker: .ageDeclared(.adult)))
+        }
+        let foreignMarker = LedgerEntry(id: EntryID(node: "x", sequence: 1), account: "someone-else",
+                                        timestamp: Fixtures.stamp(1), kind: .accountMerged(from: "guest"))
+        XCTAssertThrowsError(try main.absorb(guest, mergedAt: foreignMarker)) { error in
+            XCTAssertEqual(error as? LedgerError, .foreignAccount(expected: Fixtures.account, actual: "someone-else"))
         }
         XCTAssertEqual(main.tailCount, 0)
     }
